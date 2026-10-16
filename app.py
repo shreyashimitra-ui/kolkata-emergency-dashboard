@@ -2,47 +2,54 @@
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
-from math import radians, sin, cos, sqrt, atan2
+import requests
 
 st.set_page_config(
-    page_title="Kolkata Emergency GIS Dashboard",
+    page_title="Kolkata Emergency Dashboard",
     layout="wide"
 )
 
-st.title("Kolkata Emergency Response Dashboard")
-st.write("Interactive GIS Disaster Management Simulation")
-st.warning("Educational demonstration only. Not for real emergency navigation.")
+st.title("Kolkata Emergency Response GIS Dashboard")
+st.warning(
+    "Educational simulation only. "
+    "Do not use for actual emergency navigation."
+)
 
 facilities = [
     {"name": "Demo Hospital A", "type": "Hospital",
      "lat": 22.585, "lon": 88.410},
-    {"name": "Demo Shelter B", "type": "Shelter",
+    {"name": "Demo Hospital B", "type": "Hospital",
+     "lat": 22.570, "lon": 88.440},
+    {"name": "Demo Shelter A", "type": "Shelter",
      "lat": 22.575, "lon": 88.430},
-    {"name": "Demo Fire Station C", "type": "Fire Station",
-     "lat": 22.565, "lon": 88.400}
+    {"name": "Demo Shelter B", "type": "Shelter",
+     "lat": 22.600, "lon": 88.420},
+    {"name": "Demo Fire Station A", "type": "Fire Station",
+     "lat": 22.565, "lon": 88.400},
+    {"name": "Demo Fire Station B", "type": "Fire Station",
+     "lat": 22.590, "lon": 88.450}
 ]
 
-def distance_km(lat1, lon1, lat2, lon2):
-    R = 6371
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = (
-        sin(dlat / 2) ** 2
-        + cos(radians(lat1)) * cos(radians(lat2))
-        * sin(dlon / 2) ** 2
-    )
-    return 2 * R * atan2(sqrt(a), sqrt(1 - a))
+try:
+    api_key = st.secrets["ORS_API_KEY"]
+except (KeyError, FileNotFoundError):
+    st.error("ORS_API_KEY is missing from Streamlit Secrets.")
+    st.stop()
 
-st.sidebar.header("Emergency Controls")
+st.sidebar.header("Emergency controls")
 
 disaster = st.sidebar.selectbox(
-    "Select Disaster",
+    "Incident type",
     ["Flood", "Fire", "Medical Emergency"]
 )
 
 facility_type = st.sidebar.selectbox(
-    "Select Emergency Facility",
+    "Facility type",
     ["Hospital", "Shelter", "Fire Station"]
+)
+
+st.sidebar.caption(
+    "Facilities are fictional demonstration points."
 )
 
 if "incident" not in st.session_state:
@@ -50,30 +57,103 @@ if "incident" not in st.session_state:
 
 lat, lon = st.session_state.incident
 
-matching = [
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_route(key, origin_lat, origin_lon, dest_lat, dest_lon):
+    url = (
+        "https://api.heigit.org/openrouteservice/v2/"
+        "directions/driving-car/geojson"
+    )
+
+    body = {
+        "coordinates": [
+            [origin_lon, origin_lat],
+            [dest_lon, dest_lat]
+        ]
+    }
+
+    response = requests.post(
+        url,
+        json=body,
+        headers={
+            "Authorization": key,
+            "Content-Type": "application/json"
+        },
+        timeout=25
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    feature = data["features"][0]
+    summary = feature["properties"]["summary"]
+    coordinates = feature["geometry"]["coordinates"]
+
+    route = [[p[1], p[0]] for p in coordinates]
+
+    return summary["distance"], summary["duration"], route
+
+
+candidates = [
     f for f in facilities
     if f["type"] == facility_type
 ]
 
-nearest = min(
-    matching,
-    key=lambda f: distance_km(
-        lat, lon, f["lat"], f["lon"]
+results = []
+
+with st.spinner("Finding reachable facilities using roads..."):
+    for f in candidates:
+        try:
+            distance, duration, route = get_route(
+                api_key,
+                round(lat, 5),
+                round(lon, 5),
+                f["lat"],
+                f["lon"]
+            )
+
+            results.append(
+                (distance, duration, route, f)
+            )
+
+        except (
+            requests.RequestException,
+            KeyError,
+            IndexError,
+            ValueError
+        ):
+            continue
+
+nearest = (
+    min(results, key=lambda item: item[0])
+    if results else None
+)
+
+c1, c2, c3 = st.columns(3)
+
+c1.metric("Incident", disaster)
+
+c2.metric(
+    "Nearest reachable demo facility",
+    nearest[3]["name"] if nearest else "Unavailable"
+)
+
+c3.metric(
+    "Road distance",
+    f"{nearest[0] / 1000:.2f} km" if nearest else "N/A"
+)
+
+if nearest:
+    st.write(
+        f"Estimated driving time: "
+        f"**{nearest[1] / 60:.1f} minutes** "
+        "(routing model, not live traffic)."
     )
-)
-
-distance = distance_km(
-    lat, lon, nearest["lat"], nearest["lon"]
-)
-
-col1, col2, col3 = st.columns(3)
-
-col1.metric("Disaster", disaster)
-col2.metric("Nearest Demo Facility", nearest["name"])
-col3.metric("Straight-Line Distance", f"{distance:.2f} km")
-
-st.subheader("Interactive Emergency Map")
-st.write("Click anywhere on the map to select an incident location.")
+else:
+    st.error(
+        "No road route was returned. Check the API key, "
+        "quota, connectivity, or incident location."
+    )
 
 m = folium.Map(
     location=[lat, lon],
@@ -82,8 +162,8 @@ m = folium.Map(
 
 folium.Marker(
     [lat, lon],
-    tooltip="Selected Incident",
-    icon=folium.Icon(color="red", icon="warning-sign")
+    tooltip="Incident",
+    icon=folium.Icon(color="red")
 ).add_to(m)
 
 for f in facilities:
@@ -94,39 +174,38 @@ for f in facilities:
         icon=folium.Icon(color="blue")
     ).add_to(m)
 
-folium.PolyLine(
-    [
-        [lat, lon],
-        [nearest["lat"], nearest["lon"]]
-    ],
-    color="green",
-    weight=5,
-    tooltip="Straight-line connection (not a road route)"
-).add_to(m)
+if nearest:
+    folium.PolyLine(
+        nearest[2],
+        color="green",
+        weight=6,
+        tooltip="Road route to nearest reachable demo facility"
+    ).add_to(m)
 
-result = st_folium(
+st.write("Click the map to move the incident point.")
+
+map_data = st_folium(
     m,
-    height=500,
+    height=520,
     width=None,
-    key="emergency_map"
+    key="route_map"
 )
 
-if result and result.get("last_clicked"):
-    clicked = result["last_clicked"]
-    new_location = [clicked["lat"], clicked["lng"]]
+if map_data and map_data.get("last_clicked"):
+    p = map_data["last_clicked"]
 
-    if new_location != st.session_state.incident:
-        st.session_state.incident = new_location
+    new = [
+        round(p["lat"], 5),
+        round(p["lng"], 5)
+    ]
+
+    if new != st.session_state.incident:
+        st.session_state.incident = new
         st.rerun()
 
-st.subheader("Emergency Facility Information")
-
-st.write("Selected facility:", nearest["name"])
-st.write("Facility type:", nearest["type"])
-st.write("Straight-line distance:", round(distance, 2), "km")
-
-st.info(
-    "This first version uses fictional facilities and "
-    "straight-line distances. Actual road routing and "
-    "verified facilities will be added in the next stage."
+st.caption(
+    "Nearest facility is selected by calculated road "
+    "distance among demonstration candidates. "
+    "Flooded roads, closures, traffic, and actual "
+    "facility capacity are not considered."
 )
